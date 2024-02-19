@@ -1,0 +1,1 @@
+DEFMT_LOG=info cargo run --example adafruit_feather_spi_sd_card
