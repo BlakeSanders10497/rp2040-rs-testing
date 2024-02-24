@@ -62,8 +62,6 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
-
 // The macro for our start-up function
 use adafruit_feather_rp2040::entry;
 
@@ -95,16 +93,22 @@ use adafruit_feather_rp2040::hal::gpio;
 // higher-level drivers.
 use adafruit_feather_rp2040::hal;
 
+// use exclusive device for SD card reader
+use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
+
 // Link in the embedded_sdmmc crate.
 // The `SdMmcSpi` is used for block level access to the card.
 // And the `VolumeManager` gives access to the FAT filesystem functions.
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
+// Dummy chip select to make the spi device happy lol
+use embedded_sdmmc::sdcard::DummyCsPin;
+
 // Get the file open mode enum:
 use embedded_sdmmc::filesystem::Mode;
 
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::blocking::delay::DelayUs;
+// DelayNs, used in Timers, to replace DelayMs and DelayUs defined in this file previously
+use embedded_hal::delay::DelayNs;
 
 /// A dummy timesource, which is mostly important for creating files.
 #[derive(Default)]
@@ -135,8 +139,8 @@ const BLINK_ERR_5_SHORT: [u8; 10] = [1u8, 0u8, 1u8, 0u8, 1u8, 0u8, 1u8, 0u8, 1u8
 const BLINK_ERR_6_SHORT: [u8; 12] = [1u8, 0u8, 1u8, 0u8, 1u8, 0u8, 1u8, 0u8, 1u8, 0u8, 1u8, 0u8];
 
 fn blink_signals(
-    pin: &mut dyn embedded_hal::digital::v2::OutputPin<Error = core::convert::Infallible>,
-    delay: &mut dyn DelayMs<u32>,
+    pin: &mut dyn embedded_hal::digital::OutputPin<Error = core::convert::Infallible>,
+    delay: &mut dyn DelayNs,
     sig: &[u8],
 ) {
     for bit in sig {
@@ -159,8 +163,8 @@ fn blink_signals(
 }
 
 fn blink_signals_loop(
-    pin: &mut dyn embedded_hal::digital::v2::OutputPin<Error = core::convert::Infallible>,
-    delay: &mut dyn DelayMs<u32>,
+    pin: &mut dyn embedded_hal::digital::OutputPin<Error = core::convert::Infallible>,
+    delay: &mut dyn DelayNs,
     sig: &[u8],
 ) -> ! {
     loop {
@@ -175,7 +179,7 @@ fn main() -> ! {
 
     // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
+    // let core = pac::CorePeripherals::take().unwrap(); // lol
 
     // Set up the watchdog driver - needed by the clock setup code
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
@@ -214,27 +218,31 @@ fn main() -> ! {
     let spi_mosi: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.mosi.reconfigure();
     let spi_miso: gpio::Pin<_, gpio::FunctionSpi, gpio::PullUp> = pins.miso.reconfigure();
     let spi_cs = pins.d25.into_push_pull_output();
+    
+    // Create a SpiBus on SPI0
+    let spi_bus = spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sclk));
 
-    // Create the SPI driver instance for the SPI0 device
-    let spi = spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sclk));
-
-    // Exchange the uninitialised SPI driver for an initialised one
-    let spi = spi.init(
+    // Exchange the uninitialised SPI bus for an initialised one
+    let spi_bus = spi_bus.init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
         400.kHz(), // card initialization happens at low baud rate
         embedded_hal::spi::MODE_0,
     );
 
+    // Make a SpiDevice for the SdCard
+    let spi_device = ExclusiveDevice::new(spi_bus, DummyCsPin, NoDelay);
+
     // We need a delay implementation that can be passed to SdCard and still be used
     // for the blink signals.
-    let mut delay = &SharedDelay::new(cortex_m::delay::Delay::new(
-        core.SYST,
-        clocks.system_clock.freq().to_Hz(),
-    ));
+    let mut delay = rp2040_hal::Timer::new(
+        pac.TIMER,
+        &mut pac.RESETS,
+        &clocks,
+    );
 
     info!("Initialize SPI SD/MMC data structures...");
-    let sdcard = SdCard::new(spi, spi_cs, delay);
+    let sdcard = SdCard::new(spi_device, spi_cs, delay);
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
 
     blink_signals(&mut led_pin, &mut delay, &BLINK_OK_LONG);
@@ -253,10 +261,10 @@ fn main() -> ! {
     // Now that the card is initialized, clock can go faster
     volume_mgr
         .device()
-        .spi(|spi| spi.set_baudrate(clocks.peripheral_clock.freq(), 16.MHz()));
+        .spi(|spi_device| spi_device.bus_mut().set_baudrate(clocks.peripheral_clock.freq(), 16.MHz()));
 
     info!("Getting Volume 0...");
-    let mut volume = match volume_mgr.get_volume(VolumeIdx(0)) {
+    let mut volume = match volume_mgr.open_volume(VolumeIdx(0)) {
         Ok(v) => v,
         Err(e) => {
             error!("Error getting volume 0: {}", defmt::Debug2Format(&e));
@@ -268,7 +276,7 @@ fn main() -> ! {
 
     // After we have the volume (partition) of the drive we got to open the
     // root directory:
-    let dir = match volume_mgr.open_root_dir(&volume) {
+    let mut dir = match volume.open_root_dir() {
         Ok(dir) => dir,
         Err(e) => {
             error!("Error opening root dir: {}", defmt::Debug2Format(&e));
@@ -281,54 +289,58 @@ fn main() -> ! {
 
     // This shows how to iterate through the directory and how
     // to get the file names (and print them in hope they are UTF-8 compatible):
-    volume_mgr
-        .iterate_dir(&volume, &dir, |ent| {
-            info!(
-                "/{}.{}",
-                core::str::from_utf8(ent.name.base_name()).unwrap(),
-                core::str::from_utf8(ent.name.extension()).unwrap()
-            );
-        })
-        .unwrap();
+    dir.iterate_dir(|ent| {
+        info!(
+            "/{}.{}",
+            core::str::from_utf8(ent.name.base_name()).unwrap(),
+            core::str::from_utf8(ent.name.extension()).unwrap()
+        );
+    }).unwrap(); // fixme better way?
 
     blink_signals(&mut led_pin, &mut delay, &BLINK_OK_LONG);
 
     let mut successful_read = false;
 
     // Next we going to read a file from the SD card:
-    if let Ok(mut file) = volume_mgr.open_file_in_dir(&mut volume, &dir, "log.txt", Mode::ReadOnly) {
-        let mut buf = [0u8; 32];
-        let read_count = volume_mgr.read(&volume, &mut file, &mut buf).unwrap();
-        volume_mgr.close_file(&volume, file).unwrap();
-
-        if read_count >= 2 {
-            info!("READ {} bytes: {}", read_count, buf);
-
-            // If we read what we wrote before the last reset,
-            // we set a flag so that the success blinking at the end
-            // changes it's pattern.
-            if buf[0] == 0x42 && buf[1] == 0x1E {
-                successful_read = true;
+    if let Ok(mut file) = dir.open_file_in_dir("log.txt", Mode::ReadOnly) {
+        while !file.is_eof() {
+            let mut buffer = [0u8; 32];
+            let offset = file.offset();
+            let mut len = file.read(&mut buffer).unwrap(); //fixme better way to do this or no?
+            info!("{:08x} {:02x}", offset, &buffer[0..len]);
+            while len < buffer.len() {
+                info!("\t");
+                len += 1;
             }
+            info!(" |");
+            for b in buffer.iter() { // todo improve printout of each line in here. Maybe just info!() the entire buffer at once?
+                let ch = char::from(*b);
+                if ch.is_ascii_graphic() {
+                    info!("{}", ch);
+                } else {
+                    info!(".");
+                }
+            }
+            info!("|\n");
+
+            if len > 2 && buffer[0] == b"t"[0] && buffer[1] == b"e"[0] {successful_read = true;} // scuffed but we should only have one line of data anyways
         }
     }
 
     blink_signals(&mut led_pin, &mut delay, &BLINK_OK_LONG);
 
-    match volume_mgr.open_file_in_dir(&mut volume, &dir, "log.txt", Mode::ReadWriteCreateOrTruncate) {
+    let file = dir.open_file_in_dir("log.txt", Mode::ReadWriteCreateOrTruncate);
+    match file {
         Ok(mut file) => {
-            volume_mgr
-                .write(&mut volume, &mut file, b"test log data")
+            file
+                .write(b"test log data")
                 .unwrap();
-            volume_mgr.close_file(&volume, file).unwrap();
         }
         Err(e) => {
             error!("Error opening file 'log.txt': {}", defmt::Debug2Format(&e));
             blink_signals_loop(&mut led_pin, &mut delay, &BLINK_ERR_6_SHORT);
         }
     }
-
-    volume_mgr.free();
 
     blink_signals(&mut led_pin, &mut delay, &BLINK_OK_LONG);
 
@@ -347,31 +359,5 @@ fn main() -> ! {
         }
 
         delay.delay_ms(1000);
-    }
-}
-
-// Can be removed once we have https://github.com/rp-rs/rp-hal/pull/614,
-// ie. when we move to rp2040-hal 0.9
-struct SharedDelay {
-    inner: RefCell<cortex_m::delay::Delay>,
-}
-
-impl SharedDelay {
-    fn new(delay: cortex_m::delay::Delay) -> Self {
-        Self {
-            inner: delay.into(),
-        }
-    }
-}
-
-impl DelayMs<u32> for &SharedDelay {
-    fn delay_ms(&mut self, ms: u32) {
-        self.inner.borrow_mut().delay_ms(ms);
-    }
-}
-
-impl DelayUs<u8> for &SharedDelay {
-    fn delay_us(&mut self, us: u8) {
-        self.inner.borrow_mut().delay_us(us as u32);
     }
 }

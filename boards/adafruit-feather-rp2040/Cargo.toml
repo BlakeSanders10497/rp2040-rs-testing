@@ -21,6 +21,7 @@ rp2040-hal = { workspace = true, features = [ "defmt" ] }
 cortex-m.workspace = true
 panic-halt.workspace = true
 embedded-hal.workspace = true
+embedded-hal-bus.workspace = true
 fugit.workspace = true
 nb.workspace = true
 smart-leds.workspace = true
